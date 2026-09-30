@@ -187,21 +187,27 @@ KSU_BRANCH="${KSU_BRANCH:?KSU_BRANCH is required}"
 CUSTOM_REF="${CUSTOM_REF:-}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
-# Stable = 稳定层，钉在最后一次能编译的 commit（各 manager 无独立 "stable" 分支）。
-# 选取规则：既要有成功的 build-manager/Release run（manager APK 从该 run 取），
-# 又要其内核源码仍匹配 CI 的补丁布局 (见 build.yml)。刷新时用一次 Stable dispatch 验证。
+# Stable / Dev = 静态钉版层（手动维护 SHA）。动态解析会加大维护难度且不可复现，故这两层
+# 只用固定 commit；仅 Latest 层动态追踪 main。选取的 commit 需满足：既有成功的
+# build-manager/Release run（manager APK 从该 run 取），又其内核源码仍匹配 CI 的补丁布局
+# (见 build.yml)。刷新时用一次全矩阵 dispatch 验证。
 #
-# 2026-09: 官方版上游自 v3.3.x 重构了 hook/syscall_event_bridge 等 API，与本仓 6 月的
-# 兼容 shim + SUSFS 6-22 补丁不匹配 (12 处 -Werror + patch reject)，故官方版 Stable 钉回
-# 最后一次全矩阵绿色 (2026-06-29) 所用的 v3.2.5 = b0bc817b (2026-06-22)，与 config/config
-# 里 SUSFS 的 6-22 提交配对。SukiSU/ReSukiSU 暂留 9 月提交 (其绿色基线未重建)。
-OFFICIAL_STABLE_REF="b0bc817b4e966aa6aa830834eaf6ef765d821d40"  # v3.2.5 (2026-06-22)
-SUKISU_STABLE_REF="7755cdb36f63945f286d7b1cab662b42b18f2789"
-RESUKISU_STABLE_REF="6d18926ae6eeb571a04c1ce7552c324d606fa9d8"
+# 2026-09-30: 按用户要求 Stable 与 Dev 均钉到各上游 main 的最新 commit（"都最新"），用一次
+# 全矩阵编译确认当前上游能否直接编过。注意：本仓 6 月的兼容 shim (.github/scripts/
+# ensure-ksu-compat.py + build.yml) 与 SUSFS 补丁仍针对 v3.2.x API，与最新 KSU 大概率不匹配
+# (12 处 -Werror + patch reject)，需后续更新补丁"再修"。若全编译失败、需回退到可编译基线，
+# 把下面三行 STABLE 改回 v3.2.5=b0bc817b… 系列，并将 config/config 的 custom 改回 true。
+OFFICIAL_STABLE_REF="08a3b087e49227c8a6731c5f1114998b5e25255b"  # tiann/KernelSU main HEAD (2026-09-30)
+SUKISU_STABLE_REF="cf87e3f4ddd3f6e5464d85acf56aaa6950e70841"    # SukiSU-Ultra main HEAD (2026-09-30)
+RESUKISU_STABLE_REF="94dd3c93c2053a84fd752df6eb85db99b7d70ab8"  # ReSukiSU main HEAD (2026-09-30)
 
-# Dev = 开发层，动态追踪各上游的 'dev' 分支（取其最新且有成功 build-manager/Release run 的
-# commit）；上游若无 'dev' 分支则回落到 'main'，即 Dev 与 Latest 同步为一个（当前 ReSukiSU
-# 无 dev 分支 -> Dev=Latest）。解析逻辑见 resolve_tracking / ksu_resolve_branch_sha。
+# Dev = 开发层，同为静态钉版；当前与 Stable 同步钉到最新 commit（"都最新"）。
+OFFICIAL_DEV_REF="08a3b087e49227c8a6731c5f1114998b5e25255b"
+SUKISU_DEV_REF="cf87e3f4ddd3f6e5464d85acf56aaa6950e70841"
+RESUKISU_DEV_REF="94dd3c93c2053a84fd752df6eb85db99b7d70ab8"
+
+# Latest = 最新层，动态追踪各上游 main 的最新（有成功 build-manager/Release run 的）commit。
+# 解析逻辑见 resolve_tracking / ksu_resolve_branch_sha。
 SUKISU_REPO="SukiSU-Ultra/SukiSU-Ultra"
 
 emit_env() {
@@ -250,9 +256,9 @@ ksu_variant_repo() {
   esac
 }
 
-# Resolve a tier that tracks a live upstream branch.
-#   Latest(最新) -> always 'main'
-#   Dev(开发)    -> 'dev' if the upstream has one, else 'main' (Dev=Latest, "两边同步为一个")
+# Resolve a tier that tracks a live upstream branch. Only Latest(最新) uses this now
+# (-> always 'main'); Stable/Dev are static pins. The generic branch arg + 'dev'→'main'
+# fallback is kept for any future tier that tracks a non-main branch.
 # Sets RESOLVED_KSU_{REPO,SOURCE_BRANCH,SHA}.
 resolve_tracking() {
   local preferred_branch="$1"
@@ -310,10 +316,9 @@ case "$KSU_BRANCH" in
     RESUKISU_REF="$RESUKISU_STABLE_REF"
     ;;
   "Dev(开发)")
-    resolve_tracking "dev"
-    OFFICIAL_REF="$RESOLVED_KSU_SHA"
-    SUKISU_REF="$RESOLVED_KSU_SHA"
-    RESUKISU_REF="$RESOLVED_KSU_SHA"
+    OFFICIAL_REF="$OFFICIAL_DEV_REF"
+    SUKISU_REF="$SUKISU_DEV_REF"
+    RESUKISU_REF="$RESUKISU_DEV_REF"
     ;;
   "Latest(最新)")
     resolve_tracking "main"
@@ -363,7 +368,7 @@ emit_env "RESOLVED_KSU_SOURCE_BRANCH" "${RESOLVED_KSU_SOURCE_BRANCH:-}"
 emit_env "RESOLVED_KSU_REPO" "${RESOLVED_KSU_REPO:-}"
 
 echo "KSU branch: ${KSU_BRANCH} -> ${BRANCH}"
-if [ "$KSU_BRANCH" = "Latest(最新)" ] || [ "$KSU_BRANCH" = "Dev(开发)" ]; then
+if [ "$KSU_BRANCH" = "Latest(最新)" ]; then
   emit_env "KSU_LATEST_SOURCE" "${KSU_LATEST_SOURCE:-unknown}"
   echo "${KSU_BRANCH} resolved: repo=${RESOLVED_KSU_REPO} branch=${RESOLVED_KSU_SOURCE_BRANCH} sha=${RESOLVED_KSU_SHA} source=${KSU_LATEST_SOURCE:-unknown}"
 fi
