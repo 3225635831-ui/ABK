@@ -48,17 +48,35 @@ ksu_workflow_run_id_for_branch() {
   return 1
 }
 
-ksu_main_head_sha() {
+ksu_branch_head_sha() {
   local repo="$1"
+  local branch="$2"
   local sha
 
   KSU_API_REPO="$repo"
-  sha="$(ksu_github_api_curl "https://api.github.com/repos/${repo}/git/ref/heads/main" \
+  sha="$(ksu_github_api_curl "https://api.github.com/repos/${repo}/git/ref/heads/${branch}" \
     | jq -r '.object.sha // empty')"
   if [ -z "$sha" ] || [ "$sha" = "null" ]; then
     return 1
   fi
   printf '%s\n' "$sha"
+}
+
+ksu_main_head_sha() {
+  ksu_branch_head_sha "$1" "main"
+}
+
+# Returns 0 if <branch> exists on <repo> (no stdout). Used to decide whether the
+# Dev tier can track its own 'dev' branch or must collapse onto 'main'.
+ksu_branch_exists() {
+  local repo="$1"
+  local branch="$2"
+  local sha
+
+  KSU_API_REPO="$repo"
+  sha="$(ksu_github_api_curl "https://api.github.com/repos/${repo}/git/ref/heads/${branch}" 2>/dev/null \
+    | jq -r '.object.sha // empty' 2>/dev/null)" || true
+  [ -n "$sha" ] && [ "$sha" != "null" ]
 }
 
 ksu_latest_build_manager_sha_on_branch() {
@@ -78,38 +96,45 @@ ksu_latest_build_manager_sha_on_branch() {
   printf '%s\n' "$sha"
 }
 
-# Sets KSU_RESOLVED_LATEST_SHA and KSU_LATEST_SOURCE (no stdout; safe under set -u).
-ksu_resolve_latest_sha() {
+# Sets KSU_RESOLVED_LATEST_SHA and KSU_LATEST_SOURCE for the given branch
+# (no stdout; safe under set -u). Prefers the branch HEAD when it has a successful
+# Release/build-manager run, else the newest such commit on the branch.
+ksu_resolve_branch_sha() {
   local repo="$1"
-  local main_head sha
+  local branch="${2:-main}"
+  local head sha
 
   KSU_RESOLVED_LATEST_SHA=""
   KSU_LATEST_SOURCE=""
 
-  main_head="$(ksu_main_head_sha "$repo")" || {
-    echo "::error::Failed to read main HEAD for ${repo}" >&2
+  head="$(ksu_branch_head_sha "$repo" "$branch")" || {
+    echo "::error::Failed to read ${branch} HEAD for ${repo}" >&2
     return 1
   }
 
-  if ksu_workflow_run_id_for_head_sha "$repo" "$KSU_RELEASE_WORKFLOW" "$main_head" >/dev/null; then
-    KSU_LATEST_SOURCE="main-head-release"
-    KSU_RESOLVED_LATEST_SHA="$main_head"
+  if ksu_workflow_run_id_for_head_sha "$repo" "$KSU_RELEASE_WORKFLOW" "$head" >/dev/null; then
+    KSU_LATEST_SOURCE="${branch}-head-release"
+    KSU_RESOLVED_LATEST_SHA="$head"
     return 0
   fi
 
-  if ksu_workflow_run_id_for_head_sha "$repo" "$KSU_BUILD_MANAGER_WORKFLOW" "$main_head" >/dev/null; then
-    KSU_LATEST_SOURCE="main-head-build-manager"
-    KSU_RESOLVED_LATEST_SHA="$main_head"
+  if ksu_workflow_run_id_for_head_sha "$repo" "$KSU_BUILD_MANAGER_WORKFLOW" "$head" >/dev/null; then
+    KSU_LATEST_SOURCE="${branch}-head-build-manager"
+    KSU_RESOLVED_LATEST_SHA="$head"
     return 0
   fi
 
-  sha="$(ksu_latest_build_manager_sha_on_branch "$repo" "main" 1)" || {
-    echo "::error::No successful Release or build-manager run on ${repo}@main (required for Latest)" >&2
+  sha="$(ksu_latest_build_manager_sha_on_branch "$repo" "$branch" 1)" || {
+    echo "::error::No successful Release or build-manager run on ${repo}@${branch}" >&2
     return 1
   }
-  KSU_LATEST_SOURCE="main-fallback"
+  KSU_LATEST_SOURCE="${branch}-fallback"
   KSU_RESOLVED_LATEST_SHA="$sha"
   return 0
+}
+
+ksu_resolve_latest_sha() {
+  ksu_resolve_branch_sha "$1" "main"
 }
 
 # Sets KSU_MANAGER_RUN_ID, MANAGER_RUN_SOURCE, and MANAGER_RUN_FALLBACK_MAIN (no stdout; safe under set -u).
@@ -162,19 +187,21 @@ KSU_BRANCH="${KSU_BRANCH:?KSU_BRANCH is required}"
 CUSTOM_REF="${CUSTOM_REF:-}"
 GITHUB_TOKEN="${GITHUB_TOKEN:-}"
 
-# Pin stable builds to the latest usable commit on each manager's main branch
-# (managers publish no dedicated "stable" branch). Refresh monthly: pick the newest
-# commit that has a successful build-manager run AND whose kernel source still matches
-# the CI patch layout (see build.yml). Bumped 2026-09 — verify with a Stable dispatch
-# when refreshing, since the manager APK is fetched from that commit's build-manager run.
-OFFICIAL_STABLE_REF="85cab5f841b55bed180c10dfdbe33f876aba7820"
+# Stable = 稳定层，钉在最后一次能编译的 commit（各 manager 无独立 "stable" 分支）。
+# 选取规则：既要有成功的 build-manager/Release run（manager APK 从该 run 取），
+# 又要其内核源码仍匹配 CI 的补丁布局 (见 build.yml)。刷新时用一次 Stable dispatch 验证。
+#
+# 2026-09: 官方版上游自 v3.3.x 重构了 hook/syscall_event_bridge 等 API，与本仓 6 月的
+# 兼容 shim + SUSFS 6-22 补丁不匹配 (12 处 -Werror + patch reject)，故官方版 Stable 钉回
+# 最后一次全矩阵绿色 (2026-06-29) 所用的 v3.2.5 = b0bc817b (2026-06-22)，与 config/config
+# 里 SUSFS 的 6-22 提交配对。SukiSU/ReSukiSU 暂留 9 月提交 (其绿色基线未重建)。
+OFFICIAL_STABLE_REF="b0bc817b4e966aa6aa830834eaf6ef765d821d40"  # v3.2.5 (2026-06-22)
 SUKISU_STABLE_REF="7755cdb36f63945f286d7b1cab662b42b18f2789"
 RESUKISU_STABLE_REF="6d18926ae6eeb571a04c1ce7552c324d606fa9d8"
 
-# Pin development builds to commits with a successful build-manager run on main.
-OFFICIAL_DEV_REF="33d0c9205df47b6b1b61c25c13afa164b88871d1"
-SUKISU_DEV_REF="9fbe8fe8ca90c62c259c5894bf96d02ac31209b9"
-RESUKISU_DEV_REF="246d3e52e667cb72ce8f70c93b70d3b42b100b76"
+# Dev = 开发层，动态追踪各上游的 'dev' 分支（取其最新且有成功 build-manager/Release run 的
+# commit）；上游若无 'dev' 分支则回落到 'main'，即 Dev 与 Latest 同步为一个（当前 ReSukiSU
+# 无 dev 分支 -> Dev=Latest）。解析逻辑见 resolve_tracking / ksu_resolve_branch_sha。
 SUKISU_REPO="SukiSU-Ultra/SukiSU-Ultra"
 
 emit_env() {
@@ -213,33 +240,41 @@ check_ref() {
   fi
 }
 
-resolve_latest() {
-  local repo source_branch sha
-
-  case "$KSU_VARIANT" in
-    Official)
-      repo="tiann/KernelSU"
-      ;;
-    SukiSU)
-      # GKI builds use main; builtin is for OnePlus only (oneplus-build.yml, not resolve-ksu-ref).
-      repo="$SUKISU_REPO"
-      ;;
-    ReSukiSU)
-      repo="ReSukiSU/ReSukiSU"
-      ;;
-    *)
-      echo "::error::Unknown KSU variant for Latest: ${KSU_VARIANT}" >&2
-      exit 1
-      ;;
+ksu_variant_repo() {
+  case "$1" in
+    Official) printf '%s\n' "tiann/KernelSU" ;;
+    # GKI builds use main; builtin is for OnePlus only (oneplus-build.yml, not resolve-ksu-ref).
+    SukiSU) printf '%s\n' "$SUKISU_REPO" ;;
+    ReSukiSU) printf '%s\n' "ReSukiSU/ReSukiSU" ;;
+    *) return 1 ;;
   esac
+}
 
-  source_branch="main"
-  if ! ksu_resolve_latest_sha "$repo"; then
+# Resolve a tier that tracks a live upstream branch.
+#   Latest(最新) -> always 'main'
+#   Dev(开发)    -> 'dev' if the upstream has one, else 'main' (Dev=Latest, "两边同步为一个")
+# Sets RESOLVED_KSU_{REPO,SOURCE_BRANCH,SHA}.
+resolve_tracking() {
+  local preferred_branch="$1"
+  local repo branch
+
+  repo="$(ksu_variant_repo "$KSU_VARIANT")" || {
+    echo "::error::Unknown KSU variant for tracking tier: ${KSU_VARIANT}" >&2
+    exit 1
+  }
+
+  branch="$preferred_branch"
+  if [ "$branch" != "main" ] && ! ksu_branch_exists "$repo" "$branch"; then
+    echo "::notice::${repo} 无 '${branch}' 分支，改为追踪 'main' (Dev 与 Latest 同步)" >&2
+    branch="main"
+  fi
+
+  if ! ksu_resolve_branch_sha "$repo" "$branch"; then
     return 1
   fi
 
   RESOLVED_KSU_REPO="$repo"
-  RESOLVED_KSU_SOURCE_BRANCH="$source_branch"
+  RESOLVED_KSU_SOURCE_BRANCH="$branch"
   RESOLVED_KSU_SHA="$KSU_RESOLVED_LATEST_SHA"
 }
 
@@ -275,12 +310,13 @@ case "$KSU_BRANCH" in
     RESUKISU_REF="$RESUKISU_STABLE_REF"
     ;;
   "Dev(开发)")
-    OFFICIAL_REF="$OFFICIAL_DEV_REF"
-    SUKISU_REF="$SUKISU_DEV_REF"
-    RESUKISU_REF="$RESUKISU_DEV_REF"
+    resolve_tracking "dev"
+    OFFICIAL_REF="$RESOLVED_KSU_SHA"
+    SUKISU_REF="$RESOLVED_KSU_SHA"
+    RESUKISU_REF="$RESOLVED_KSU_SHA"
     ;;
   "Latest(最新)")
-    resolve_latest
+    resolve_tracking "main"
     OFFICIAL_REF="$RESOLVED_KSU_SHA"
     SUKISU_REF="$RESOLVED_KSU_SHA"
     RESUKISU_REF="$RESOLVED_KSU_SHA"
@@ -327,7 +363,7 @@ emit_env "RESOLVED_KSU_SOURCE_BRANCH" "${RESOLVED_KSU_SOURCE_BRANCH:-}"
 emit_env "RESOLVED_KSU_REPO" "${RESOLVED_KSU_REPO:-}"
 
 echo "KSU branch: ${KSU_BRANCH} -> ${BRANCH}"
-if [ "$KSU_BRANCH" = "Latest(最新)" ]; then
+if [ "$KSU_BRANCH" = "Latest(最新)" ] || [ "$KSU_BRANCH" = "Dev(开发)" ]; then
   emit_env "KSU_LATEST_SOURCE" "${KSU_LATEST_SOURCE:-unknown}"
-  echo "Latest resolved: repo=${RESOLVED_KSU_REPO} branch=${RESOLVED_KSU_SOURCE_BRANCH} sha=${RESOLVED_KSU_SHA} source=${KSU_LATEST_SOURCE:-unknown}"
+  echo "${KSU_BRANCH} resolved: repo=${RESOLVED_KSU_REPO} branch=${RESOLVED_KSU_SOURCE_BRANCH} sha=${RESOLVED_KSU_SHA} source=${KSU_LATEST_SOURCE:-unknown}"
 fi
